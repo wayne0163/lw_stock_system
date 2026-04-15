@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 项目特定
+database/*.db
+output/
+logs/
+config/gui_state.json
+config/gui_config.json
+input/
+output/
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# 敏感文件
+config/tushare_token.txt
+secrets.json
+.password_manager.json

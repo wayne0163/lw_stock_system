@@ -1,0 +1,8 @@
+# 股票筛选系统依赖
+
+# 核心数据
+pandas>=1.3.0
+tushare>=1.2.0
+
+# GUI（Tkinter 通常内置，无需安装）
+# 如果有需要：pip install tkinter (Windows 通常已包含)
