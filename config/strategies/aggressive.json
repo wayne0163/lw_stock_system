@@ -1,0 +1,49 @@
+{
+  "name": "aggressive",
+  "description": "进取型策略：专注高增长、高景气的成长股。要求极高的营收和利润增速，结合动量捕捉主升浪。",
+  "version": "1.2",
+  "params": {
+    "sectors": [
+      "全市场"
+    ],
+    "basic_filters": {
+      "enable_cap": true,
+      "market_cap_min": 50.0,
+      "market_cap_max": 1500.0
+    },
+    "financial_filters": {
+      "roe_dt_min": 15.0,
+      "roic_min": 8.0,
+      "tr_yoy_min": 30.0,
+      "dt_netprofit_yoy_min": 30.0,
+      "grossprofit_margin_min": 25.0,
+      "debt_to_assets_max": 65.0
+    },
+    "tech_params": {
+      "ma_periods": [
+        20,
+        120,
+        240
+      ],
+      "rsi_periods": [
+        6,
+        12
+      ],
+      "vma_periods": [
+        5,
+        10
+      ],
+      "require_ma_order": true,
+      "require_rsi_s_range": true,
+      "rsi_s_min": 50.0,
+      "rsi_s_max": 85.0,
+      "require_vma_cross": true
+    },
+    "price_distance_filters": {
+      "enable_52w_high": true,
+      "pct_within_52w_high_max": 25.0,
+      "enable_52w_low": false,
+      "pct_above_52w_low_min": 0.0
+    }
+  }
+}

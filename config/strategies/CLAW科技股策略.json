@@ -1,0 +1,43 @@
+{
+  "name": "CLAW科技股策略",
+  "description": "CLAW科技股策略",
+  "version": "1.0",
+  "params": {
+    "sectors": [
+      "全市场"
+    ],
+    "basic_filters": {
+      "enable_cap": true,
+      "market_cap_min": 50.0,
+      "market_cap_max": 2000.0
+    },
+    "financial_filters": {
+      "roe_dt_min": 0.0,
+      "roic_min": 0.0,
+      "tr_yoy_min": 5.0,
+      "dt_netprofit_yoy_min": 50.0,
+      "grossprofit_margin_min": 0.0,
+      "debt_to_assets_max": 40.0
+    },
+    "tech_params": {
+      "ma_periods": [
+        20,
+        120,
+        240
+      ],
+      "rsi_periods": [
+        6,
+        12
+      ],
+      "vma_periods": [
+        5,
+        10
+      ],
+      "require_ma_order": true,
+      "require_rsi_s_range": true,
+      "rsi_s_min": 60.0,
+      "rsi_s_max": 90.0,
+      "require_vma_cross": true
+    }
+  }
+}

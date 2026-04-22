@@ -1,0 +1,59 @@
+{
+  "name": "AI科技股投资系统",
+  "description": "基于《A股科技股投资系统建设报告》的实战配置：聚焦AI硬件65%+人形机器人30%，三位一体筛选（基本面+技术面+催化剂），年化200%目标。",
+  "version": "1.0",
+  "params": {
+    "sectors": ["AI 硬件"],
+    "tag_pools": ["AI硬件"],
+    "basic_filters": {
+      "enable_cap": true,
+      "market_cap_min": 30.0,
+      "market_cap_max": 1500.0
+    },
+    "financial_filters": {
+      "roe_dt_min": 8.0,
+      "roic_min": 5.0,
+      "dt_netprofit_yoy_min": 15.0,
+      "tr_yoy_min": 10.0,
+      "grossprofit_margin_min": 20.0,
+      "debt_to_assets_max": 70.0,
+      "require_profit_positive": false,
+      "max_age_days": 180
+    },
+    "tech_params": {
+      "ma_periods": [50, 150, 200],
+      "rsi_periods": [6, 12],
+      "vma_periods": [5, 10],
+      "require_ma_order": true,
+      "require_rsi_s_range": true,
+      "rsi_s_min": 50.0,
+      "rsi_s_max": 85.0,
+      "require_vma_cross": true,
+      "price_vs_52w_high_pct_max": 25.0,
+      "require_near_52w_high": true
+    },
+    "price_distance_filters": {
+      "enable_52w_high": true,
+      "pct_within_52w_high_max": 25.0,
+      "enable_52w_low": false,
+      "pct_above_52w_low_min": 0.0
+    },
+    "position_rules": {
+      "max_single_position": 25.0,
+      "ai_hardware_weight": 65.0,
+      "robot_weight": 30.0,
+      "cash_reserve": 5.0
+    },
+    "negative_filters": {
+      "exclude_st": true,
+      "exclude_negative_eps": true,
+      "exclude_below_52w_low_50pct": true
+    }
+  },
+  "notes": {
+    "技术指标说明": "MA排列对应50日>150日>200日均线多头，RSI(6)在50-85区间，成交量5日均线上穿10日均线",
+    "财务日期限制": "只取最新一期财报（ann_date距今≤90天），确保财务数据不过期",
+    "52周高点限制": "股价需在52周高点的25%以内，避免买在绝对高位",
+    "仓位分配": "AI硬件65%仓位（约3-4只），人形机器人30%仓位（2只），现金5%"
+  }
+}

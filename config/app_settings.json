@@ -1,0 +1,20 @@
+{
+  "user_profile": {
+    "annual_return_target": "2026年 200%, 未来年化 50%-100%",
+    "max_drawdown_tolerance": "20%",
+    "source_of_funds": "闲置资金，股市专用",
+    "risk_preference": "比较激进",
+    "investment_philosophy": "趋势跟踪 + 行为心理博弈"
+  },
+  "gui_settings": {
+    "theme": "dark",
+    "default_market_env": "震荡市",
+    "market_env_options": [
+      "极度亢奋",
+      "多头排列",
+      "震荡收缩",
+      "情绪冰点",
+      "空头趋势"
+    ]
+  }
+}
