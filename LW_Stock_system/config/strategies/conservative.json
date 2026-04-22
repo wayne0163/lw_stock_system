@@ -1,0 +1,32 @@
+{
+  "name": "conservative",
+  "description": "保守型策略：寻找财务极其稳健、分红能力强的大市值龙头。低负债、高 ROIC，适合长期资产配置。",
+  "version": "1.2",
+  "params": {
+    "sectors": ["全市场"],
+    "basic_filters": {
+      "enable_cap": true,
+      "market_cap_min": 300.0,
+      "market_cap_max": 10000.0
+    },
+    "financial_filters": {
+      "roe_dt_min": 12.0,
+      "roic_min": 10.0,
+      "tr_yoy_min": 5.0,
+      "n_income_yoy_min": 5.0,
+      "gpm_min": 20.0,
+      "debt_to_assets_max": 40.0
+    },
+    "tech_params": {
+      "ma_periods": [20, 120, 240],
+      "rsi_periods": [6, 12],
+      "vma_periods": [5, 10],
+      "require_ma_order": true,
+      "require_rsi_cross": false,
+      "require_rsi_s_range": true,
+      "rsi_s_min": 40.0,
+      "rsi_s_max": 75.0,
+      "require_vma_cross": true
+    }
+  }
+}
