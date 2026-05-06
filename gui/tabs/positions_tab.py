@@ -25,6 +25,10 @@ class PositionsTab(tk.Frame):
         self.config_manager = config
         self.config = self.config_manager.config
         self.stat_card_values = {}  # 存储每个卡片的数值标签 {key: label_widget}
+        self._tip_window = None
+        self._tip_after = None
+        self._last_tip = None
+        self._strategy_info = {}  # {tree_iid: {'sl_info': str, 'tp_info': str}}
         self.init_ui()
 
     def init_ui(self):
@@ -107,8 +111,8 @@ class PositionsTab(tk.Frame):
             ("q", "持仓", 70),
             ("cp", "成本", 85),
             ("cur", "现价", 85),
-            ("sl", "止损", 80),
-            ("tp", "止盈", 80),
+            ("sl", "止损价", 95),
+            ("tp", "止盈价", 95),
             ("pnl", "盈亏", 90),
             ("pct", "盈亏%", 80),
         ]
@@ -124,6 +128,8 @@ class PositionsTab(tk.Frame):
 
         self.tree.bind("<Double-1>", lambda e: self.on_double_click())
         self.tree.bind("<Button-3>", self.on_right_click)
+        self.tree.bind('<Motion>', self._on_tree_motion)
+        self.tree.bind('<Leave>', self._on_tree_leave)
         set_treeview_style(self.tree)
 
         # ========== 交易流水 ==========
@@ -457,6 +463,7 @@ class PositionsTab(tk.Frame):
             # 刷新持仓表格
             for i in self.tree.get_children():
                 self.tree.delete(i)
+            self._strategy_info.clear()
             df_pos = self.pm.get_all()
             for _, r in df_pos.iterrows():
                 pnl_val = r.get('pnl')
@@ -467,21 +474,60 @@ class PositionsTab(tk.Frame):
                     pnl_pct_val = 0.0
                 tag = ('profit',) if pnl_val > 0 else ('loss',) if pnl_val < 0 else ()
 
-                # 止损止盈策略显示
-                sl_type = r.get('stop_loss_type', 'trailing')
-                tp_type = r.get('profit_exit_type', 'tiered')
-                sl_display = {'fixed': '固定', 'trailing': '移动', 'atr': 'ATR'}.get(sl_type, str(sl_type))
-                tp_display = {'fixed': '目标', 'trailing': '移动', 'tiered': '分批', 'rsi': 'RSI'}.get(tp_type, str(tp_type))
+                # 止损止盈 - 计算触发价格（与 StopLossProfitManager 保持一致）
+                sl_type = r.get('stop_loss_type', 'fixed')
+                tp_type = r.get('profit_exit_type', 'trailing')
+                cost = r['cost_price']
+                highest = r.get('highest_since_buy', 0) or cost
+                if isinstance(highest, float) and pd.isna(highest):
+                    highest = cost
+
+                # 止损触发价
+                sl_price = None
+                if sl_type == 'fixed':
+                    sl_price = cost * (1 - float(r.get('stop_loss_value', 0.08)))
+                elif sl_type == 'trailing':
+                    sl_price = highest * (1 - float(r.get('stop_loss_value', 0.20)))
+                    if r.get('trailing_mode', 'strict') == 'loose':
+                        sl_price -= highest * 0.02
+                elif sl_type == 'breakeven':
+                    activate = float(r.get('breakeven_activate', 0.10))
+                    if highest >= cost * (1 + activate):
+                        sl_price = cost
+                    else:
+                        sl_price = cost * (1 - float(r.get('stop_loss_value', 0.08)))
+
+                # 止盈触发价
+                tp_price = None
+                if tp_type == 'target':
+                    tp_raw = r.get('target_price')
+                    if tp_raw is not None and not pd.isna(tp_raw):
+                        tp_price = float(tp_raw)
+                elif tp_type == 'trailing':
+                    tp_price = highest * (1 - float(r.get('profit_exit_value', 0.15)))
+                elif tp_type == 'scale':
+                    s1 = float(r.get('scale_profit_1', 0.20))
+                    s2 = float(r.get('scale_profit_2', 0.40))
+                    tp_display = f"+{s1*100:.0f}/{s2*100:.0f}/{float(r.get('scale_profit_3', 0.60))*100:.0f}%"
+
+                if tp_type != 'scale':
+                    tp_display = f"{tp_price:.3f}" if tp_price is not None else \
+                        {'target': '目标', 'trailing': '移动', 'scale': '分批'}.get(tp_type, tp_type)
+                sl_display = f"{sl_price:.3f}" if sl_price is not None else \
+                    {'fixed': '固定', 'trailing': '移动', 'breakeven': '保本'}.get(sl_type, sl_type)
 
                 cur_p = r.get('current_price')
                 cur_p_s = f"{float(cur_p):.3f}" if cur_p and not pd.isna(cur_p) else f"{r['cost_price']:.3f}"
 
-                self.tree.insert('', 'end', values=(
+                iid = self.tree.insert('', 'end', values=(
                     r['ts_code'], r['name'], int(r['quantity']),
                     f"{r['cost_price']:.3f}", cur_p_s,
                     sl_display, tp_display,
                     f"{pnl_val:,.2f}", f"{pnl_pct_val:+.2f}%"
                 ), tags=tag)
+
+                # 存储策略信息供 tooltip 使用
+                self._strategy_info[iid] = self._make_strategy_info(r)
 
             self.tree.tag_configure('profit', foreground=Colors.ACCENT_RED)
             self.tree.tag_configure('loss', foreground=Colors.ACCENT_GREEN)
@@ -584,6 +630,122 @@ class PositionsTab(tk.Frame):
             messagebox.showinfo("成功", f"持仓已导出到:\n{file_path}")
         except Exception as e:
             messagebox.showerror("导出失败", str(e))
+
+    # ========== Tooltip 策略信息提示 ==========
+
+    def _make_strategy_info(self, r):
+        """构建策略信息文本（供 tooltip 使用）"""
+        cost = r['cost_price']
+        sl_type = r.get('stop_loss_type', 'fixed')
+        sl_value = r.get('stop_loss_value', 0.08)
+        highest = r.get('highest_since_buy', 0) or cost
+        if isinstance(highest, float) and pd.isna(highest):
+            highest = cost
+        trailing_mode = r.get('trailing_mode', 'strict')
+
+        sl_lines = []
+        sl_names = {'fixed': '固定比例止损', 'trailing': '移动止损', 'breakeven': '保本止损'}
+        sl_lines.append(f"类型: {sl_names.get(sl_type, sl_type)}({sl_type})")
+        if sl_type == 'fixed':
+            trigger = cost * (1 - sl_value)
+            sl_lines.append(f"止损比例: {sl_value*100:.0f}%")
+            sl_lines.append(f"触发价: {trigger:.3f} (成本 {cost:.3f})")
+        elif sl_type == 'trailing':
+            trigger = highest * (1 - sl_value)
+            if trailing_mode == 'loose':
+                trigger -= highest * 0.02
+            sl_lines.append(f"回落比例: {sl_value*100:.0f}%")
+            tm_names = {'strict': '严格-回落即触发', 'loose': '宽松-额外2%容忍'}
+            sl_lines.append(f"模式: {tm_names.get(trailing_mode, trailing_mode)}")
+            sl_lines.append(f"触发价: {trigger:.3f}")
+            sl_lines.append(f"跟踪最高价: {highest:.3f}")
+        elif sl_type == 'breakeven':
+            activate = float(r.get('breakeven_activate', 0.10))
+            sl_lines.append(f"初始止损: {sl_value*100:.0f}% 即 {cost*(1-sl_value):.3f}")
+            sl_lines.append(f"激活条件: 涨{activate*100:.0f}% 即 {cost*(1+activate):.3f}")
+            if highest >= cost * (1 + activate):
+                sl_lines.append(f"状态: ✅ 已激活 保本价 {cost:.3f}")
+            else:
+                sl_lines.append(f"状态: ⏳ 未激活 当前止损 {cost*(1-sl_value):.3f}")
+
+        tp_type = r.get('profit_exit_type', 'trailing')
+        tp_value = r.get('profit_exit_value', 0.15)
+        tp_target = r.get('target_price')
+
+        tp_lines = []
+        tp_names = {'target': '目标价止盈', 'trailing': '移动止盈', 'scale': '分批止盈'}
+        tp_lines.append(f"类型: {tp_names.get(tp_type, tp_type)}({tp_type})")
+        if tp_type == 'target':
+            if tp_target is not None and not pd.isna(tp_target):
+                tp_lines.append(f"目标价: {tp_target:.3f}")
+            else:
+                tp_lines.append("目标价: 未设置")
+        elif tp_type == 'trailing':
+            trigger = highest * (1 - tp_value)
+            tp_lines.append(f"回落比例: {tp_value*100:.0f}%")
+            tp_lines.append(f"触发价: {trigger:.3f}")
+            tp_lines.append(f"跟踪最高价: {highest:.3f}")
+        elif tp_type == 'scale':
+            s1 = float(r.get('scale_profit_1', 0.20))
+            s2 = float(r.get('scale_profit_2', 0.40))
+            s3 = float(r.get('scale_profit_3', 0.60))
+            r1 = float(r.get('scale_ratio_1', 0.33))
+            r2 = float(r.get('scale_ratio_2', 0.33))
+            profit_pct = (r.get('current_price', 0) or cost - cost) / cost if cost > 0 else 0
+            tp_lines.append(f"第1批: +{s1*100:.0f}% ({cost*(1+s1):.3f}) 卖{r1*100:.0f}%")
+            tp_lines.append(f"第2批: +{s2*100:.0f}% ({cost*(1+s2):.3f}) 卖{r2*100:.0f}%")
+            tp_lines.append(f"第3批: +{s3*100:.0f}% 高点回落8%清仓")
+
+        return {'sl': '\n'.join(sl_lines), 'tp': '\n'.join(tp_lines)}
+
+    def _on_tree_motion(self, event):
+        """鼠标悬停时延迟显示策略 tooltip"""
+        col = self.tree.identify_column(event.x)
+        item = self.tree.identify_row(event.y)
+        cell = (item, col)
+
+        if cell == self._last_tip and self._tip_window:
+            return
+        self._hide_strategy_tip()
+        self._last_tip = cell
+
+        if col not in ('#6', '#7') or not item or item not in self._strategy_info:
+            return
+
+        key = 'sl' if col == '#6' else 'tp'
+        prefix = '🛑 止损策略' if col == '#6' else '🎯 止盈策略'
+        text = f"{prefix}\n{'-'*20}\n{self._strategy_info[item][key]}"
+
+        self._tip_after = self.after(400, lambda t=text: self._show_strategy_tip(t))
+
+    def _show_strategy_tip(self, text):
+        """显示 tooltip 弹出窗口"""
+        self._hide_strategy_tip()
+        x = self.winfo_pointerx() + 15
+        y = self.winfo_pointery() + 10
+        self._tip_window = tw = tk.Toplevel(self)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        tw.attributes('-topmost', True)
+        frame = tk.Frame(tw, bg='#FFFFCC', relief=tk.SOLID, borderwidth=1)
+        frame.pack()
+        tk.Label(frame, text=text, justify=tk.LEFT,
+                bg='#FFFFCC', fg=Colors.TEXT_PRIMARY,
+                font=("Microsoft YaHei", 9), padx=8, pady=6).pack()
+
+    def _on_tree_leave(self, event=None):
+        """鼠标离开树状表格时隐藏 tooltip"""
+        self._last_tip = None
+        self._hide_strategy_tip()
+
+    def _hide_strategy_tip(self):
+        """隐藏 tooltip"""
+        if self._tip_after:
+            self.after_cancel(self._tip_after)
+            self._tip_after = None
+        if self._tip_window:
+            self._tip_window.destroy()
+            self._tip_window = None
 
 
 # ==================== 对话框类 ====================
@@ -953,9 +1115,9 @@ class CashOpDialog(tk.Toplevel):
 
 
 class StopLossProfitDialog(tk.Toplevel):
-    """止盈止损策略配置对话框"""
-    STOP_LOSS_TYPES = ['trailing', 'fixed', 'atr']
-    PROFIT_EXIT_TYPES = ['tiered', 'trailing', 'rsi', 'fixed']
+    """止盈止损策略配置对话框（v2）"""
+    STOP_LOSS_TYPES = ['fixed', 'trailing', 'breakeven']
+    PROFIT_TYPES = ['target', 'trailing', 'scale']
     TRAILING_MODES = ['strict', 'loose']
 
     def __init__(self, parent, pm, pos_data, callback):
@@ -964,7 +1126,7 @@ class StopLossProfitDialog(tk.Toplevel):
         self.pos_data = pos_data
         self.callback = callback
         self.title(f"🎯 止盈止损策略 - {pos_data['name']}")
-        self.geometry("600x700")
+        self.geometry("560x620")
         self.configure(bg=Colors.BG_DARK)
         self.resizable(False, False)
         self.init_ui()
@@ -977,200 +1139,270 @@ class StopLossProfitDialog(tk.Toplevel):
         # 标题
         tk.Label(main_f, text=f"📊 {self.pos_data['name']} ({self.pos_data['ts_code']})",
                 bg=Colors.BG_DARK, fg=Colors.PRIMARY_DARK,
-                font=("Microsoft YaHei", 14, "bold")).pack(anchor=tk.W, pady=15)
+                font=("Microsoft YaHei", 14, "bold")).pack(anchor=tk.W, pady=10)
 
         # 持仓信息卡片
-        info_card = tk.Frame(main_f, bg=Colors.BG_CARD, padx=15, pady=10)
-        info_card.pack(fill=tk.X, pady=15)
-        tk.Label(info_card, text=f"持仓数量: {self.pos_data['quantity']}股",
-                bg=Colors.BG_CARD, fg=Colors.TEXT_PRIMARY,
-                font=("Microsoft YaHei", 10)).pack(anchor=tk.W)
-        tk.Label(info_card, text=f"成本价格: {self.pos_data['cost_price']:.3f}元",
+        info_card = tk.Frame(main_f, bg=Colors.BG_CARD, padx=15, pady=8)
+        info_card.pack(fill=tk.X, pady=10)
+        cost = self.pos_data['cost_price']
+        highest = self.pos_data.get('highest_since_buy', 0) or cost
+        tk.Label(info_card, text=f"持仓: {self.pos_data['quantity']}股  |  成本: {cost:.3f}  |  最高: {highest:.3f}",
                 bg=Colors.BG_CARD, fg=Colors.TEXT_PRIMARY,
                 font=("Microsoft YaHei", 10)).pack(anchor=tk.W)
 
-        # 止损策略卡片
+        # ======== 止损策略卡片 ========
         sl_card = tk.LabelFrame(main_f, text=" 🛑 止损策略 ",
                                bg=Colors.BG_DARK, fg=Colors.ACCENT_RED,
                                font=("Microsoft YaHei", 11, "bold"), padx=15, pady=10)
-        sl_card.pack(fill=tk.X, pady=10)
+        sl_card.pack(fill=tk.X, pady=8)
 
         sl_inner = tk.Frame(sl_card, bg=Colors.BG_CARD)
         sl_inner.pack(fill=tk.X)
 
-        row1 = tk.Frame(sl_inner, bg=Colors.BG_CARD, pady=8)
-        row1.pack(fill=tk.X)
-        tk.Label(row1, text="止损类型:", bg=Colors.BG_CARD, fg=Colors.TEXT_PRIMARY,
-                font=("Microsoft YaHei", 10), width=12, anchor=tk.W).pack(side=tk.LEFT)
-        self.sl_type_var = tk.StringVar(value='trailing')
-        sl_type_cf = ttk.Combobox(row1, textvariable=self.sl_type_var,
-                                  values=self.STOP_LOSS_TYPES, state='readonly', width=12)
-        sl_type_cf.pack(side=tk.LEFT)
-        sl_type_cf.bind('<<ComboboxSelected>>', lambda e: self.on_sl_type_changed())
+        # 止损类型
+        r1 = tk.Frame(sl_inner, bg=Colors.BG_CARD, pady=6)
+        r1.pack(fill=tk.X)
+        tk.Label(r1, text="类型:", bg=Colors.BG_CARD, fg=Colors.TEXT_PRIMARY,
+                font=("Microsoft YaHei", 10), width=10, anchor=tk.W).pack(side=tk.LEFT)
+        self.sl_type_var = tk.StringVar(value='fixed')
+        cf = ttk.Combobox(r1, textvariable=self.sl_type_var, values=self.STOP_LOSS_TYPES,
+                          state='readonly', width=12)
+        cf.pack(side=tk.LEFT)
+        cf.bind('<<ComboboxSelected>>', lambda e: self._update_sl_ui())
 
-        row2 = tk.Frame(sl_inner, bg=Colors.BG_CARD, pady=8)
-        row2.pack(fill=tk.X)
-        tk.Label(row2, text="止损比例(%):", bg=Colors.BG_CARD, fg=Colors.TEXT_PRIMARY,
-                font=("Microsoft YaHei", 10), width=12, anchor=tk.W).pack(side=tk.LEFT)
-        self.sl_value_var = tk.StringVar(value='10')
-        tk.Entry(row2, textvariable=self.sl_value_var, width=15,
+        # 止损比例（所有类型共用）
+        r2 = tk.Frame(sl_inner, bg=Colors.BG_CARD, pady=6)
+        r2.pack(fill=tk.X)
+        tk.Label(r2, text="止损比例:", bg=Colors.BG_CARD, fg=Colors.TEXT_PRIMARY,
+                font=("Microsoft YaHei", 10), width=10, anchor=tk.W).pack(side=tk.LEFT)
+        self.sl_value_var = tk.StringVar(value='8')
+        tk.Entry(r2, textvariable=self.sl_value_var, width=8,
                 bg=Colors.BG_NAV, fg=Colors.TEXT_PRIMARY,
                 insertbackground=Colors.TEXT_PRIMARY).pack(side=tk.LEFT)
+        tk.Label(r2, text="%", bg=Colors.BG_CARD, fg=Colors.TEXT_SECONDARY,
+                font=("Microsoft YaHei", 9)).pack(side=tk.LEFT, padx=3)
+        tk.Label(r2, text="初始/固定止损比例", bg=Colors.BG_CARD, fg=Colors.TEXT_MUTED,
+                font=("Microsoft YaHei", 8)).pack(side=tk.LEFT, padx=(8, 0))
 
-        row3 = tk.Frame(sl_inner, bg=Colors.BG_CARD, pady=8)
-        row3.pack(fill=tk.X)
-        tk.Label(row3, text="移动模式:", bg=Colors.BG_CARD, fg=Colors.TEXT_PRIMARY,
-                font=("Microsoft YaHei", 10), width=12, anchor=tk.W).pack(side=tk.LEFT)
+        # 保本激活涨幅（仅 breakeven）
+        self.be_row = tk.Frame(sl_inner, bg=Colors.BG_CARD, pady=6)
+        tk.Label(self.be_row, text="保本激活:", bg=Colors.BG_CARD, fg=Colors.TEXT_PRIMARY,
+                font=("Microsoft YaHei", 10), width=10, anchor=tk.W).pack(side=tk.LEFT)
+        self.be_var = tk.StringVar(value='10')
+        tk.Entry(self.be_row, textvariable=self.be_var, width=8,
+                bg=Colors.BG_NAV, fg=Colors.TEXT_PRIMARY,
+                insertbackground=Colors.TEXT_PRIMARY).pack(side=tk.LEFT)
+        tk.Label(self.be_row, text="%", bg=Colors.BG_CARD, fg=Colors.TEXT_SECONDARY,
+                font=("Microsoft YaHei", 9)).pack(side=tk.LEFT, padx=3)
+        tk.Label(self.be_row, text="涨超此比例后止损移至成本价", bg=Colors.BG_CARD,
+                fg=Colors.TEXT_MUTED, font=("Microsoft YaHei", 8)).pack(side=tk.LEFT, padx=(8, 0))
+
+        # 移动模式（仅 trailing）
+        self.tm_row = tk.Frame(sl_inner, bg=Colors.BG_CARD, pady=6)
+        tk.Label(self.tm_row, text="移动模式:", bg=Colors.BG_CARD, fg=Colors.TEXT_PRIMARY,
+                font=("Microsoft YaHei", 10), width=10, anchor=tk.W).pack(side=tk.LEFT)
         self.trailing_mode_var = tk.StringVar(value='strict')
-        trailing_cf = ttk.Combobox(row3, textvariable=self.trailing_mode_var,
-                                  values=self.TRAILING_MODES, state='readonly', width=12)
-        trailing_cf.pack(side=tk.LEFT)
+        tcf = ttk.Combobox(self.tm_row, textvariable=self.trailing_mode_var,
+                          values=self.TRAILING_MODES, state='readonly', width=10)
+        tcf.pack(side=tk.LEFT)
+        tk.Label(self.tm_row, text="strict=严格  loose=宽松(+2%缓冲)", bg=Colors.BG_CARD,
+                fg=Colors.TEXT_MUTED, font=("Microsoft YaHei", 8)).pack(side=tk.LEFT, padx=8)
 
-        row4 = tk.Frame(sl_inner, bg=Colors.BG_CARD, pady=8)
-        row4.pack(fill=tk.X)
-        tk.Label(row4, text="固定止损价:", bg=Colors.BG_CARD, fg=Colors.TEXT_PRIMARY,
-                font=("Microsoft YaHei", 10), width=12, anchor=tk.W).pack(side=tk.LEFT)
-        self.fixed_sl_var = tk.StringVar(value='')
-        tk.Entry(row4, textvariable=self.fixed_sl_var, width=15,
-                bg=Colors.BG_NAV, fg=Colors.TEXT_PRIMARY,
-                insertbackground=Colors.TEXT_PRIMARY).pack(side=tk.LEFT)
-
-        # 止盈策略卡片
+        # ======== 止盈策略卡片 ========
         pe_card = tk.LabelFrame(main_f, text=" 🎯 止盈策略 ",
                                bg=Colors.BG_DARK, fg=Colors.ACCENT_GREEN,
                                font=("Microsoft YaHei", 11, "bold"), padx=15, pady=10)
-        pe_card.pack(fill=tk.X, pady=10)
+        pe_card.pack(fill=tk.X, pady=8)
 
         pe_inner = tk.Frame(pe_card, bg=Colors.BG_CARD)
         pe_inner.pack(fill=tk.X)
 
-        pe_row1 = tk.Frame(pe_inner, bg=Colors.BG_CARD, pady=8)
-        pe_row1.pack(fill=tk.X)
-        tk.Label(pe_row1, text="止盈类型:", bg=Colors.BG_CARD, fg=Colors.TEXT_PRIMARY,
-                font=("Microsoft YaHei", 10), width=12, anchor=tk.W).pack(side=tk.LEFT)
-        self.pe_type_var = tk.StringVar(value='tiered')
-        pe_type_cf = ttk.Combobox(pe_row1, textvariable=self.pe_type_var,
-                                 values=self.PROFIT_EXIT_TYPES, state='readonly', width=12)
-        pe_type_cf.pack(side=tk.LEFT)
+        # 止盈类型
+        pr1 = tk.Frame(pe_inner, bg=Colors.BG_CARD, pady=6)
+        pr1.pack(fill=tk.X)
+        tk.Label(pr1, text="类型:", bg=Colors.BG_CARD, fg=Colors.TEXT_PRIMARY,
+                font=("Microsoft YaHei", 10), width=10, anchor=tk.W).pack(side=tk.LEFT)
+        self.pe_type_var = tk.StringVar(value='trailing')
+        pcf = ttk.Combobox(pr1, textvariable=self.pe_type_var, values=self.PROFIT_TYPES,
+                          state='readonly', width=12)
+        pcf.pack(side=tk.LEFT)
+        pcf.bind('<<ComboboxSelected>>', lambda e: self._update_pe_ui())
 
-        tiered_row = tk.Frame(pe_inner, bg=Colors.BG_CARD, pady=8)
-        tiered_row.pack(fill=tk.X)
-        tk.Label(tiered_row, text="分批止盈(%):", bg=Colors.BG_CARD, fg=Colors.TEXT_PRIMARY,
-                font=("Microsoft YaHei", 10), width=12, anchor=tk.W).pack(side=tk.LEFT)
-        tier_inputs = tk.Frame(tiered_row, bg=Colors.BG_CARD)
-        tier_inputs.pack(side=tk.LEFT)
-        tk.Label(tier_inputs, text="第1批:", bg=Colors.BG_CARD, fg=Colors.TEXT_SECONDARY,
-                font=("Microsoft YaHei", 9)).pack(side=tk.LEFT)
-        self.tier1_var = tk.StringVar(value='15')
-        tk.Entry(tier_inputs, textvariable=self.tier1_var, width=5,
-                bg=Colors.BG_NAV, fg=Colors.TEXT_PRIMARY,
-                insertbackground=Colors.TEXT_PRIMARY).pack(side=tk.LEFT, padx=(0, 10))
-        tk.Label(tier_inputs, text="第2批:", bg=Colors.BG_CARD, fg=Colors.TEXT_SECONDARY,
-                font=("Microsoft YaHei", 9)).pack(side=tk.LEFT)
-        self.tier2_var = tk.StringVar(value='25')
-        tk.Entry(tier_inputs, textvariable=self.tier2_var, width=5,
-                bg=Colors.BG_NAV, fg=Colors.TEXT_PRIMARY,
-                insertbackground=Colors.TEXT_PRIMARY).pack(side=tk.LEFT, padx=(0, 10))
-        tk.Label(tier_inputs, text="第3批:", bg=Colors.BG_CARD, fg=Colors.TEXT_SECONDARY,
-                font=("Microsoft YaHei", 9)).pack(side=tk.LEFT)
-        self.tier3_var = tk.StringVar(value='40')
-        tk.Entry(tier_inputs, textvariable=self.tier3_var, width=5,
+        # 移动止盈比例（用于 trailing）
+        self.tp_row = tk.Frame(pe_inner, bg=Colors.BG_CARD, pady=6)
+        tk.Label(self.tp_row, text="回落比例:", bg=Colors.BG_CARD, fg=Colors.TEXT_PRIMARY,
+                font=("Microsoft YaHei", 10), width=10, anchor=tk.W).pack(side=tk.LEFT)
+        self.pe_value_var = tk.StringVar(value='15')
+        tk.Entry(self.tp_row, textvariable=self.pe_value_var, width=8,
                 bg=Colors.BG_NAV, fg=Colors.TEXT_PRIMARY,
                 insertbackground=Colors.TEXT_PRIMARY).pack(side=tk.LEFT)
+        tk.Label(self.tp_row, text="%", bg=Colors.BG_CARD, fg=Colors.TEXT_SECONDARY,
+                font=("Microsoft YaHei", 9)).pack(side=tk.LEFT, padx=3)
+        tk.Label(self.tp_row, text="从最高价回落此比例触发", bg=Colors.BG_CARD,
+                fg=Colors.TEXT_MUTED, font=("Microsoft YaHei", 8)).pack(side=tk.LEFT, padx=(8, 0))
 
-        other_row = tk.Frame(pe_inner, bg=Colors.BG_CARD, pady=8)
-        other_row.pack(fill=tk.X)
-        tk.Label(other_row, text="RSI预警:", bg=Colors.BG_CARD, fg=Colors.TEXT_PRIMARY,
-                font=("Microsoft YaHei", 10), width=12, anchor=tk.W).pack(side=tk.LEFT)
-        self.rsi_var = tk.StringVar(value='80')
-        tk.Entry(other_row, textvariable=self.rsi_var, width=8,
+        # 分批止盈（用于 scale）
+        self.scale_frame = tk.Frame(pe_inner, bg=Colors.BG_CARD)
+
+        s_row = tk.Frame(self.scale_frame, bg=Colors.BG_CARD, pady=6)
+        s_row.pack(fill=tk.X)
+        tk.Label(s_row, text="分批止盈:", bg=Colors.BG_CARD, fg=Colors.TEXT_PRIMARY,
+                font=("Microsoft YaHei", 10), width=10, anchor=tk.W).pack(side=tk.LEFT)
+        sf = tk.Frame(s_row, bg=Colors.BG_CARD)
+        sf.pack(side=tk.LEFT)
+
+        self.scale_1_var = tk.StringVar(value='20')
+        self.scale_2_var = tk.StringVar(value='40')
+        self.scale_3_var = tk.StringVar(value='60')
+
+        def _mke(step, v):
+            tk.Label(sf, text=f"第{step}批 +", bg=Colors.BG_CARD, fg=Colors.TEXT_SECONDARY,
+                    font=("Microsoft YaHei", 9)).pack(side=tk.LEFT)
+            tk.Entry(sf, textvariable=v, width=4,
+                    bg=Colors.BG_NAV, fg=Colors.TEXT_PRIMARY,
+                    insertbackground=Colors.TEXT_PRIMARY).pack(side=tk.LEFT, padx=(0, 10))
+        _mke(1, self.scale_1_var)
+        _mke(2, self.scale_2_var)
+        _mke(3, self.scale_3_var)
+
+        # 分批卖出比例
+        sr_row = tk.Frame(self.scale_frame, bg=Colors.BG_CARD, pady=6)
+        sr_row.pack(fill=tk.X)
+        tk.Label(sr_row, text="卖出比例:", bg=Colors.BG_CARD, fg=Colors.TEXT_PRIMARY,
+                font=("Microsoft YaHei", 10), width=10, anchor=tk.W).pack(side=tk.LEFT)
+        srf = tk.Frame(sr_row, bg=Colors.BG_CARD)
+        srf.pack(side=tk.LEFT)
+        self.scale_r1_var = tk.StringVar(value='33')
+        self.scale_r2_var = tk.StringVar(value='33')
+        tk.Label(srf, text="第1批卖", bg=Colors.BG_CARD, fg=Colors.TEXT_SECONDARY,
+                font=("Microsoft YaHei", 9)).pack(side=tk.LEFT)
+        tk.Entry(srf, textvariable=self.scale_r1_var, width=4,
                 bg=Colors.BG_NAV, fg=Colors.TEXT_PRIMARY,
                 insertbackground=Colors.TEXT_PRIMARY).pack(side=tk.LEFT)
-        tk.Label(other_row, text="  目标价:", bg=Colors.BG_CARD, fg=Colors.TEXT_PRIMARY,
-                font=("Microsoft YaHei", 10), width=8, anchor=tk.W).pack(side=tk.LEFT, padx=(20, 0))
+        tk.Label(srf, text="%  第2批卖", bg=Colors.BG_CARD, fg=Colors.TEXT_SECONDARY,
+                font=("Microsoft YaHei", 9)).pack(side=tk.LEFT)
+        tk.Entry(srf, textvariable=self.scale_r2_var, width=4,
+                bg=Colors.BG_NAV, fg=Colors.TEXT_PRIMARY,
+                insertbackground=Colors.TEXT_PRIMARY).pack(side=tk.LEFT)
+        tk.Label(srf, text="%  第3批清仓", bg=Colors.BG_CARD, fg=Colors.TEXT_SECONDARY,
+                font=("Microsoft YaHei", 9)).pack(side=tk.LEFT)
+
+        # 目标价（用于 target）
+        self.target_row = tk.Frame(pe_inner, bg=Colors.BG_CARD, pady=6)
+        tk.Label(self.target_row, text="目标价:", bg=Colors.BG_CARD, fg=Colors.TEXT_PRIMARY,
+                font=("Microsoft YaHei", 10), width=10, anchor=tk.W).pack(side=tk.LEFT)
         self.target_price_var = tk.StringVar(value='')
-        tk.Entry(other_row, textvariable=self.target_price_var, width=10,
+        tk.Entry(self.target_row, textvariable=self.target_price_var, width=12,
                 bg=Colors.BG_NAV, fg=Colors.TEXT_PRIMARY,
                 insertbackground=Colors.TEXT_PRIMARY).pack(side=tk.LEFT)
 
-        # 按钮
-        btn_frame = tk.Frame(main_f, bg=Colors.BG_DARK, pady=15)
+        # ======== 按钮 ========
+        btn_frame = tk.Frame(main_f, bg=Colors.BG_DARK, pady=10)
         btn_frame.pack(fill=tk.X)
 
         apply_btn = tk.Button(btn_frame, text="✓ 应用策略", bg=Colors.PRIMARY, fg="white",
                             font=("Microsoft YaHei", 11, "bold"), relief=tk.FLAT,
-                            padx=20, pady=8, cursor="hand2", command=self.apply_strategy)
+                            padx=20, pady=6, cursor="hand2", command=self.apply_strategy)
         apply_btn.pack(side=tk.LEFT, padx=5)
         apply_btn.bind("<Enter>", lambda e: apply_btn.configure(bg=Colors.PRIMARY_DARK))
         apply_btn.bind("<Leave>", lambda e: apply_btn.configure(bg=Colors.PRIMARY))
 
         reset_btn = tk.Button(btn_frame, text="↺ 重置", bg=Colors.BG_CARD, fg=Colors.TEXT_PRIMARY,
                             font=("Microsoft YaHei", 11), relief=tk.FLAT,
-                            padx=20, pady=8, cursor="hand2", command=self.reset_default)
+                            padx=20, pady=6, cursor="hand2", command=self.reset_default)
         reset_btn.pack(side=tk.LEFT, padx=5)
         reset_btn.bind("<Enter>", lambda e: reset_btn.configure(bg=Colors.BG_NAV))
         reset_btn.bind("<Leave>", lambda e: reset_btn.configure(bg=Colors.BG_CARD))
 
         close_btn = tk.Button(btn_frame, text="✕ 关闭", bg=Colors.ACCENT_RED, fg="white",
                              font=("Microsoft YaHei", 11), relief=tk.FLAT,
-                             padx=20, pady=8, cursor="hand2", command=self.destroy)
+                             padx=20, pady=6, cursor="hand2", command=self.destroy)
         close_btn.pack(side=tk.RIGHT, padx=5)
         close_btn.bind("<Enter>", lambda e: close_btn.configure(bg="#c62828"))
         close_btn.bind("<Leave>", lambda e: close_btn.configure(bg=Colors.ACCENT_RED))
 
-        self.on_sl_type_changed()
+        self._update_sl_ui()
+        self._update_pe_ui()
+
+    # ---------- UI 动态显隐 ----------
+
+    def _update_sl_ui(self):
+        sl_type = self.sl_type_var.get()
+        self.tm_row.pack_forget()
+        self.be_row.pack_forget()
+        if sl_type == 'trailing':
+            self.tm_row.pack(fill=tk.X)
+        elif sl_type == 'breakeven':
+            self.be_row.pack(fill=tk.X)
+
+    def _update_pe_ui(self):
+        pe_type = self.pe_type_var.get()
+        self.tp_row.pack_forget()
+        self.scale_frame.pack_forget()
+        self.target_row.pack_forget()
+        if pe_type == 'trailing':
+            self.tp_row.pack(fill=tk.X)
+        elif pe_type == 'scale':
+            self.scale_frame.pack(fill=tk.X)
+        elif pe_type == 'target':
+            self.target_row.pack(fill=tk.X)
+
+    # ---------- 数据加载 / 保存 ----------
 
     def load_current_strategy(self):
-        sl_type = self.pos_data.get('stop_loss_type', 'trailing')
-        sl_value = self.pos_data.get('stop_loss_value', 0.10)
-        trailing_mode = self.pos_data.get('trailing_mode', 'strict')
-        fixed_sl = self.pos_data.get('stop_loss_price')
-        pe_type = self.pos_data.get('profit_exit_type', 'tiered')
-        tier1 = self.pos_data.get('tiered_profit_1', 0.15)
-        tier2 = self.pos_data.get('tiered_profit_2', 0.25)
-        tier3 = self.pos_data.get('tiered_profit_3', 0.40)
-        rsi_level = self.pos_data.get('rsi_overbought_level', 80.0)
-        target_price = self.pos_data.get('target_price')
-
-        self.sl_type_var.set(sl_type)
-        self.sl_value_var.set(str(int(sl_value * 100)))
-        self.trailing_mode_var.set(trailing_mode)
-        if fixed_sl:
-            self.fixed_sl_var.set(str(fixed_sl))
-        self.pe_type_var.set(pe_type)
-        self.tier1_var.set(str(int(tier1 * 100)))
-        self.tier2_var.set(str(int(tier2 * 100)))
-        self.tier3_var.set(str(int(tier3 * 100)))
-        self.rsi_var.set(str(int(rsi_level)))
-        if target_price:
-            self.target_price_var.set(str(target_price))
-
-    def on_sl_type_changed(self):
-        sl_type = self.sl_type_var.get()
-        if sl_type == 'fixed':
-            self.fixed_sl_var.set(str(self.pos_data.get('stop_loss_price') or self.pos_data['cost_price']))
-        else:
-            self.fixed_sl_var.set('')
+        pd = self.pos_data
+        self.sl_type_var.set(pd.get('stop_loss_type', 'fixed'))
+        self.sl_value_var.set(str(int(pd.get('stop_loss_value', 0.08) * 100)))
+        self.trailing_mode_var.set(pd.get('trailing_mode', 'strict'))
+        self.be_var.set(str(int(pd.get('breakeven_activate', 0.10) * 100)))
+        self.pe_type_var.set(pd.get('profit_exit_type', 'trailing'))
+        self.pe_value_var.set(str(int(pd.get('profit_exit_value', 0.15) * 100)))
+        self.scale_1_var.set(str(int(pd.get('scale_profit_1', 0.20) * 100)))
+        self.scale_2_var.set(str(int(pd.get('scale_profit_2', 0.40) * 100)))
+        self.scale_3_var.set(str(int(pd.get('scale_profit_3', 0.60) * 100)))
+        self.scale_r1_var.set(str(int(pd.get('scale_ratio_1', 0.33) * 100)))
+        self.scale_r2_var.set(str(int(pd.get('scale_ratio_2', 0.33) * 100)))
+        tp = pd.get('target_price')
+        self.target_price_var.set(str(tp) if tp else '')
+        self._update_sl_ui()
+        self._update_pe_ui()
 
     def apply_strategy(self):
         try:
             pos_id = self.pos_data['id']
+            cost = self.pos_data['cost_price']
             params = {
                 'stop_loss_type': self.sl_type_var.get(),
                 'stop_loss_value': float(self.sl_value_var.get()) / 100,
                 'trailing_mode': self.trailing_mode_var.get(),
                 'profit_exit_type': self.pe_type_var.get(),
-                'tiered_profit_1': float(self.tier1_var.get()) / 100,
-                'tiered_profit_2': float(self.tier2_var.get()) / 100,
-                'tiered_profit_3': float(self.tier3_var.get()) / 100,
-                'rsi_overbought_level': float(self.rsi_var.get()),
             }
-            fixed_sl = self.fixed_sl_var.get().strip()
-            if fixed_sl:
-                params['stop_loss_price'] = float(fixed_sl)
-            target_price = self.target_price_var.get().strip()
-            if target_price:
-                params['target_price'] = float(target_price)
+            # 保本激活
+            try:
+                params['breakeven_activate'] = float(self.be_var.get()) / 100
+            except ValueError:
+                pass
+            # 移动止盈比例
+            try:
+                params['profit_exit_value'] = float(self.pe_value_var.get()) / 100
+            except ValueError:
+                pass
+            # 分批止盈
+            try:
+                params.update({
+                    'scale_profit_1': float(self.scale_1_var.get()) / 100,
+                    'scale_profit_2': float(self.scale_2_var.get()) / 100,
+                    'scale_profit_3': float(self.scale_3_var.get()) / 100,
+                    'scale_ratio_1': float(self.scale_r1_var.get()) / 100,
+                    'scale_ratio_2': float(self.scale_r2_var.get()) / 100,
+                })
+            except ValueError:
+                pass
+            # 目标价
+            tp = self.target_price_var.get().strip()
+            if tp:
+                params['target_price'] = float(tp)
+
             success = self.pm.slpm.update_strategy(pos_id, **params)
             if success:
                 messagebox.showinfo("✅ 成功", f"已为 {self.pos_data['name']} 更新止盈止损策略")
@@ -1179,19 +1411,23 @@ class StopLossProfitDialog(tk.Toplevel):
             else:
                 messagebox.showerror("❌ 错误", "更新策略失败")
         except ValueError as e:
-            messagebox.showerror("❌ 输入错误", f"请检查输入的数值是否正确：{e}")
+            messagebox.showerror("❌ 输入错误", f"请检查数值：{e}")
         except Exception as e:
             messagebox.showerror("❌ 错误", f"更新策略时出错：{e}")
 
     def reset_default(self):
-        default = self.pm.slpm.get_default_strategy()
-        self.sl_type_var.set(default['stop_loss_type'])
-        self.sl_value_var.set(str(int(default['stop_loss_value'] * 100)))
-        self.trailing_mode_var.set(default['trailing_mode'])
-        self.fixed_sl_var.set('')
-        self.pe_type_var.set(default['profit_exit_type'])
-        self.tier1_var.set(str(int(default['tiered_profit_1'] * 100)))
-        self.tier2_var.set(str(int(default['tiered_profit_2'] * 100)))
-        self.tier3_var.set(str(int(default['tiered_profit_3'] * 100)))
-        self.rsi_var.set(str(int(default['rsi_overbought_level'])))
+        d = self.pm.slpm.get_default_strategy()
+        self.sl_type_var.set(d['stop_loss_type'])
+        self.sl_value_var.set(str(int(d['stop_loss_value'] * 100)))
+        self.trailing_mode_var.set(d['trailing_mode'])
+        self.be_var.set(str(int(d['breakeven_activate'] * 100)))
+        self.pe_type_var.set(d['profit_exit_type'])
+        self.pe_value_var.set(str(int(d['profit_exit_value'] * 100)))
+        self.scale_1_var.set(str(int(d['scale_profit_1'] * 100)))
+        self.scale_2_var.set(str(int(d['scale_profit_2'] * 100)))
+        self.scale_3_var.set(str(int(d['scale_profit_3'] * 100)))
+        self.scale_r1_var.set(str(int(d['scale_ratio_1'] * 100)))
+        self.scale_r2_var.set(str(int(d['scale_ratio_2'] * 100)))
         self.target_price_var.set('')
+        self._update_sl_ui()
+        self._update_pe_ui()
