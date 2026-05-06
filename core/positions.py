@@ -3,8 +3,373 @@ import pandas as pd
 from datetime import datetime
 from pathlib import Path
 
+
+class StopLossProfitManager:
+    """
+    动态止盈止损管理器
+    适用于高弹性股票（AI硬件/机器人/固态电池等）
+    
+    支持策略类型：
+    - 止损：固定止损(fixed)、移动止损(trailing)、ATR波动止损(atr)
+    - 止盈：移动止盈(trailing)、分批止盈(tiered)、RSI超买预警(rsi)
+    """
+    
+    # 策略类型常量
+    STOP_LOSS_TYPES = ['fixed', 'trailing', 'atr']
+    PROFIT_EXIT_TYPES = ['trailing', 'tiered', 'rsi', 'fixed']
+    TRAILING_MODES = ['strict', 'loose']
+    
+    def __init__(self, db_path=None):
+        if db_path is None:
+            self.db_path = Path(__file__).parent.parent / 'database' / 'stock_data.db'
+        else:
+            self.db_path = Path(db_path)
+    
+    def _row_to_dict(self, row, columns):
+        """将数据库行转换为字典"""
+        return dict(zip(columns, row)) if row else None
+    
+    def get_position(self, pos_id):
+        """获取单个持仓记录"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute(
+                "SELECT * FROM positions WHERE id = ?", (int(pos_id),)
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+    
+    def get_all_positions(self):
+        """获取所有持仓"""
+        with sqlite3.connect(self.db_path) as conn:
+            return pd.read_sql_query("SELECT * FROM positions", conn)
+    
+    def update_strategy(self, pos_id, **kwargs):
+        """
+        修改单个持仓的止盈止损策略
+        
+        可用参数：
+        - stop_loss_type: 'fixed', 'trailing', 'atr'
+        - stop_loss_value: 止损比例 (如 0.10 表示 10%)
+        - profit_exit_type: 'trailing', 'tiered', 'rsi', 'fixed'
+        - profit_exit_value: 止盈比例
+        - trailing_mode: 'strict', 'loose'
+        - atr_multiplier: ATR倍数 (用于ATR止损)
+        - tiered_profit_1/2/3: 分批止盈点位
+        - rsi_overbought_level: RSI超买预警线
+        - stop_loss_price: 固定止损价格（仅用于fixed类型）
+        - target_price: 目标价格（仅用于fixed类型）
+        """
+        allowed_keys = [
+            'stop_loss_type', 'stop_loss_value', 'profit_exit_type', 'profit_exit_value',
+            'trailing_mode', 'atr_multiplier', 'tiered_profit_1', 'tiered_profit_2', 
+            'tiered_profit_3', 'rsi_overbought_level', 'stop_loss_price', 'target_price'
+        ]
+        
+        # 过滤只允许的字段
+        update_fields = {k: v for k, v in kwargs.items() if k in allowed_keys and v is not None}
+        
+        if not update_fields:
+            return False
+        
+        # 设置 last_updated
+        update_fields['last_updated'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        set_clause = ", ".join([f"{k} = ?" for k in update_fields.keys()])
+        params = list(update_fields.values()) + [int(pos_id)]
+        
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                f"UPDATE positions SET {set_clause} WHERE id = ?",
+                params
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+    
+    def get_default_strategy(self):
+        """获取默认策略参数"""
+        return {
+            'stop_loss_type': 'trailing',
+            'stop_loss_value': 0.10,  # 从高点回落10%止损
+            'profit_exit_type': 'tiered',
+            'profit_exit_value': 0.15,  # 第一批止盈15%
+            'trailing_mode': 'strict',
+            'atr_multiplier': 3.0,
+            'tiered_profit_1': 0.15,   # 第一批止盈15%
+            'tiered_profit_2': 0.25,   # 第二批止盈25%
+            'tiered_profit_3': 0.40,   # 第三批止盈40%（移动止损）
+            'rsi_overbought_level': 80.0,
+            'stop_loss_price': None,
+            'target_price': None
+        }
+    
+    def calc_trailing_stop(self, highest_price, current_price, stop_loss_pct, mode='strict'):
+        """
+        计算移动止损触发价
+        
+        Args:
+            highest_price: 买入后最高价
+            current_price: 当前价格
+            stop_loss_pct: 止损比例 (如 0.10 表示 10%)
+            mode: 'strict' 严格要求 | 'loose' 宽松模式(有2%容忍)
+        
+        Returns:
+            trigger_price: 触发卖出的价格
+        """
+        trigger_price = highest_price * (1 - stop_loss_pct)
+        
+        if mode == 'loose':
+            # 宽松模式：额外2%容忍，减少震荡洗盘被震出
+            tolerance = highest_price * 0.02
+            trigger_price = trigger_price - tolerance
+        
+        return trigger_price
+    
+    def calc_atr_stop(self, highest_price, atr, atr_multiplier=3.0):
+        """
+        计算ATR波动止损
+        更适合高波动股票
+        
+        Args:
+            highest_price: 买入后最高价
+            atr: 平均真实波幅
+            atr_multiplier: ATR倍数 (激进2.5, 保守3.0)
+        
+        Returns:
+            trigger_price: 触发卖出的价格
+        """
+        return highest_price - atr_multiplier * atr
+    
+    def check_stop_loss(self, pos_data, current_price, rsi=None, atr=None):
+        """
+        检查止损是否触发
+        
+        Returns:
+            dict: {'triggered': True/False, 'action': 'STOP_LOSS', 'trigger_price': xxx, 'reason': xxx}
+        """
+        stop_loss_type = pos_data.get('stop_loss_type', 'fixed')
+        stop_loss_value = pos_data.get('stop_loss_value', 0.10)
+        stop_loss_price = pos_data.get('stop_loss_price')
+        cost_price = pos_data.get('cost_price', 0)
+        highest_since_buy = pos_data.get('highest_since_buy', 0) or cost_price
+        trailing_mode = pos_data.get('trailing_mode', 'strict')
+        atr_multiplier = pos_data.get('atr_multiplier', 3.0)
+        
+        triggered = False
+        trigger_price = None
+        reason = None
+        
+        if stop_loss_type == 'fixed' and stop_loss_price:
+            # 固定止损：价格 <= 止损价
+            trigger_price = stop_loss_price
+            if current_price <= trigger_price:
+                triggered = True
+                reason = f'固定止损 {trigger_price:.2f}'
+        
+        elif stop_loss_type == 'trailing':
+            # 移动止损：从最高点回落
+            trigger_price = self.calc_trailing_stop(
+                highest_since_buy, current_price, stop_loss_value, trailing_mode
+            )
+            if current_price <= trigger_price:
+                triggered = True
+                reason = f'移动止损 从{highest_since_buy:.2f}回落{stop_loss_value*100:.0f}%到{trigger_price:.2f}'
+        
+        elif stop_loss_type == 'atr':
+            # ATR波动止损
+            if atr:
+                trigger_price = self.calc_atr_stop(highest_since_buy, atr, atr_multiplier)
+                if current_price <= trigger_price:
+                    triggered = True
+                    reason = f'ATR止损 {atr_multiplier}*ATR={atr:.2f} 触发价{trigger_price:.2f}'
+        
+        return {
+            'triggered': triggered,
+            'action': 'STOP_LOSS' if triggered else None,
+            'trigger_price': trigger_price,
+            'reason': reason
+        }
+    
+    def check_profit_exit(self, pos_data, current_price, rsi=None):
+        """
+        检查止盈是否触发
+        
+        Returns:
+            dict: {'triggered': True/False, 'action': 'SELL_ALL/SELL_HALF/SELL_THIRD/CONSIDER_SELL', 'reason': xxx}
+        """
+        profit_exit_type = pos_data.get('profit_exit_type', 'tiered')
+        profit_exit_value = pos_data.get('profit_exit_value', 0.15)
+        cost_price = pos_data.get('cost_price', 0)
+        highest_since_buy = pos_data.get('highest_since_buy', 0) or cost_price
+        rsi_overbought_level = pos_data.get('rsi_overbought_level', 80.0)
+        
+        # 计算当前盈利比例
+        profit_pct = (current_price - cost_price) / cost_price if cost_price > 0 else 0
+        
+        tiered_profit_1 = pos_data.get('tiered_profit_1', 0.15)
+        tiered_profit_2 = pos_data.get('tiered_profit_2', 0.25)
+        tiered_profit_3 = pos_data.get('tiered_profit_3', 0.40)
+        
+        triggered = False
+        action = None
+        reason = None
+        
+        if profit_exit_type == 'trailing':
+            # 移动止盈：从最高点回落指定比例
+            trigger_price = highest_since_buy * (1 - profit_exit_value)
+            if current_price <= trigger_price:
+                triggered = True
+                action = 'SELL_ALL'
+                reason = f'移动止盈 从{highest_since_buy:.2f}回落{profit_exit_value*100:.0f}%'
+        
+        elif profit_exit_type == 'tiered':
+            # 分批止盈
+            if profit_pct >= tiered_profit_3:
+                # 第三批：从高点回落8%止盈（留仓让利润奔跑）
+                trigger_price = highest_since_buy * 0.92
+                if current_price <= trigger_price:
+                    triggered = True
+                    action = 'SELL_ALL'
+                    reason = f'分批止盈第三批(涨{tiered_profit_3*100:.0f}%) 从高点回落8%'
+            elif profit_pct >= tiered_profit_2:
+                # 第二批：再卖1/3
+                triggered = True
+                action = 'SELL_THIRD'
+                reason = f'分批止盈第二批(涨{tiered_profit_2*100:.0f}%)'
+            elif profit_pct >= tiered_profit_1:
+                # 第一批：卖1/3
+                triggered = True
+                action = 'SELL_THIRD'
+                reason = f'分批止盈第一批(涨{tiered_profit_1*100:.0f}%)'
+        
+        elif profit_exit_type == 'rsi':
+            # RSI超买预警
+            if rsi and rsi >= 90:
+                triggered = True
+                action = 'FORCE_SELL'
+                reason = f'RSI极度超买({rsi:.1f}) 强制卖出'
+            elif rsi and rsi >= rsi_overbought_level:
+                triggered = True
+                action = 'CONSIDER_SELL'
+                reason = f'RSI超买({rsi:.1f}) 考虑卖出'
+        
+        elif profit_exit_type == 'fixed':
+            target_price = pos_data.get('target_price')
+            if target_price and current_price >= target_price:
+                triggered = True
+                action = 'SELL_ALL'
+                reason = f'达到目标价 {target_price:.2f}'
+        
+        return {
+            'triggered': triggered,
+            'action': action,
+            'reason': reason,
+            'profit_pct': profit_pct
+        }
+    
+    def update_highest_price(self, pos_id, current_price):
+        """更新持仓的历史最高价"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                "SELECT highest_since_buy, cost_price FROM positions WHERE id = ?",
+                (int(pos_id),)
+            )
+            row = cursor.fetchone()
+            if row:
+                current_highest = row[0] or 0
+                cost_price = row[1] or 0
+                # 更新为当前最高价（取较大值）
+                new_highest = max(current_highest, current_price, cost_price)
+                if new_highest != current_highest:
+                    conn.execute(
+                        "UPDATE positions SET highest_since_buy = ? WHERE id = ?",
+                        (new_highest, int(pos_id))
+                    )
+                    conn.commit()
+                    return new_highest
+            return None
+    
+    def check_position(self, pos_id, current_price, rsi=None, atr=None):
+        """
+        综合检查持仓状态，返回操作建议
+        
+        Returns:
+            dict: {
+                'stop_loss': {...},
+                'profit_exit': {...},
+                'action': 'HOLD'/'STOP_LOSS'/'SELL_ALL'/'SELL_THIRD'/'CONSIDER_SELL',
+                'summary': str
+            }
+        """
+        pos_data = self.get_position(pos_id)
+        if not pos_data:
+            return {'error': f'未找到持仓 ID: {pos_id}'}
+        
+        # 先更新最高价
+        self.update_highest_price(pos_id, current_price)
+        # 重新获取（更新后的）
+        pos_data = self.get_position(pos_id)
+        
+        # 检查止损
+        stop_loss_result = self.check_stop_loss(pos_data, current_price, rsi, atr)
+        
+        # 检查止盈
+        profit_result = self.check_profit_exit(pos_data, current_price, rsi)
+        
+        # 综合判断：止损优先于止盈
+        # 逻辑：
+        # 1. 如果止损触发（价格跌破防线）→ 强制止损，忽略止盈
+        # 2. 如果止盈触发 → 执行相应止盈操作
+        # 3. 如果同时触发 → 止损优先（本金安全第一）
+        action = 'HOLD'
+        summary_parts = []
+        
+        if stop_loss_result['triggered']:
+            # 止损优先：任何时候止损触发都第一优先级
+            action = 'STOP_LOSS'
+            summary_parts.append(f"⚠️ {stop_loss_result['reason']}")
+        elif profit_result['triggered']:
+            # 止盈：只有止损未触发时才执行
+            action = profit_result['action']
+            summary_parts.append(f"🎯 {profit_result['reason']}")
+        
+        if not summary_parts:
+            summary_parts.append(f"✅ 持有中 盈亏{profit_result['profit_pct']*100:.1f}%")
+        
+        return {
+            'stop_loss': stop_loss_result,
+            'profit_exit': profit_result,
+            'action': action,
+            'summary': ' | '.join(summary_parts),
+            'highest_price': pos_data.get('highest_since_buy'),
+            'profit_pct': profit_result['profit_pct']
+        }
+    
+    def get_strategy_display(self, pos_data):
+        """获取策略显示字符串"""
+        sl_type = pos_data.get('stop_loss_type', 'fixed')
+        sl_value = pos_data.get('stop_loss_value', 0.10)
+        pe_type = pos_data.get('profit_exit_type', 'tiered')
+        pe_value = pos_data.get('profit_exit_value', 0.15)
+        
+        sl_display = {
+            'fixed': f'固定{pos_data.get("stop_loss_price", "-")}',
+            'trailing': f'移动{sl_value*100:.0f}%',
+            'atr': f'ATR{pos_data.get("atr_multiplier", 3.0):.1f}倍'
+        }.get(sl_type, sl_type)
+        
+        pe_display = {
+            'fixed': f'目标{pos_data.get("target_price", "-")}',
+            'trailing': f'移动{pe_value*100:.0f}%',
+            'tiered': f'分批({pos_data.get("tiered_profit_1", 0.15)*100:.0f}/{pos_data.get("tiered_profit_2", 0.25)*100:.0f}/{pos_data.get("tiered_profit_3", 0.40)*100:.0f}%)',
+            'rsi': f'RSI{pos_data.get("rsi_overbought_level", 80):.0f}'
+        }.get(pe_type, pe_type)
+        
+        return f"止损:{sl_display} 止盈:{pe_display}"
+
+
 class PositionManager:
-    """持仓管理与交易记录 - 增强修正版"""
+    """持仓管理与交易记录 - 增强修正版（支持动态止盈止损）"""
 
     def __init__(self, db_path=None):
         # 基于当前文件位置确定项目根目录,避免相对路径依赖 cwd
@@ -14,10 +379,12 @@ class PositionManager:
             self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.init_db()
+        # 初始化止盈止损管理器
+        self.slpm = StopLossProfitManager(db_path)
 
     def init_db(self):
         with sqlite3.connect(self.db_path) as conn:
-            # 1. 持仓表
+            # 1. 持仓表（增强版 - 支持动态止盈止损）
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS positions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -31,9 +398,42 @@ class PositionManager:
                     buy_date DATE DEFAULT CURRENT_DATE,
                     target_price REAL,
                     stop_loss_price REAL,
-                    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    
+                    -- 增强止盈止损字段 ---
+                    stop_loss_type TEXT DEFAULT 'trailing',
+                    stop_loss_value REAL DEFAULT 0.10,
+                    profit_exit_type TEXT DEFAULT 'tiered',
+                    profit_exit_value REAL DEFAULT 0.15,
+                    trailing_mode TEXT DEFAULT 'strict',
+                    highest_since_buy REAL DEFAULT 0,
+                    atr_multiplier REAL DEFAULT 3.0,
+                    tiered_profit_1 REAL DEFAULT 0.15,
+                    tiered_profit_2 REAL DEFAULT 0.25,
+                    tiered_profit_3 REAL DEFAULT 0.40,
+                    rsi_overbought_level REAL DEFAULT 80.0
                 )
             """)
+            
+            # 为已存在的表添加新列（如果不存在）
+            existing_cols = [desc[1] for desc in conn.execute("PRAGMA table_info(positions)")]
+            new_columns = {
+                'stop_loss_type': "TEXT DEFAULT 'trailing'",
+                'stop_loss_value': 'REAL DEFAULT 0.10',
+                'profit_exit_type': "TEXT DEFAULT 'tiered'",
+                'profit_exit_value': 'REAL DEFAULT 0.15',
+                'trailing_mode': "TEXT DEFAULT 'strict'",
+                'highest_since_buy': 'REAL DEFAULT 0',
+                'atr_multiplier': 'REAL DEFAULT 3.0',
+                'tiered_profit_1': 'REAL DEFAULT 0.15',
+                'tiered_profit_2': 'REAL DEFAULT 0.25',
+                'tiered_profit_3': 'REAL DEFAULT 0.40',
+                'rsi_overbought_level': 'REAL DEFAULT 80.0'
+            }
+            for col, col_def in new_columns.items():
+                if col not in existing_cols:
+                    conn.execute(f"ALTER TABLE positions ADD COLUMN {col} {col_def}")
+            
             # 2. 核心流水表
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS trade_log (
@@ -433,12 +833,12 @@ class PositionManager:
                     tp = sl_tp[1] if sl_tp and sl_tp[1] is not None else None
 
                     cursor.execute("""
-                        INSERT INTO positions (ts_code, name, quantity, cost_price, buy_date, last_updated, target_price, stop_loss_price)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        INSERT INTO positions (ts_code, name, quantity, cost_price, buy_date, last_updated, target_price, stop_loss_price, highest_since_buy)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
                         ts_code_final, h['name'], h['qty'], round(cost_price, 3),
                         today, datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                        tp, sl
+                        tp, sl, cost_price  # 买入时的成本价作为初始历史最高价
                     ))
                     inserted += 1
 
