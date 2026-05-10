@@ -330,7 +330,15 @@ class PositionsTab(tk.Frame):
                           command=self.show_stop_loss_dialog)
             menu.add_command(label="📉 卖出/减仓",
                           command=self.on_double_click)
+            menu.add_separator()
+            menu.add_command(label="📈 K线图",
+                          command=lambda: self._show_stock_chart(values[0], values[1]))
             menu.post(event.x_root, event.y_root)
+
+    def _show_stock_chart(self, ts_code, name):
+        """显示K线图"""
+        from gui.stock_chart import show_stock_chart
+        show_stock_chart(self, ts_code, name)
 
     def copy_to_clipboard(self, text):
         self.clipboard_clear()

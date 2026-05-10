@@ -295,12 +295,13 @@ class AllStocksTab:
         self.status_label.config(text=message + date_hint)
 
     def on_item_double_clicked(self, event):
-        """双击查看详情"""
+        """双击查看K线图"""
         selection = self.tree.selection()
         if not selection: return
         item = selection[0]
         values = self.tree.item(item, 'values')
-        messagebox.showinfo("股票详情", f"代码: {values[2]}\n名称: {values[3]}\n当前价格: {values[4]}")
+        from gui.stock_chart import show_stock_chart
+        show_stock_chart(self.parent, values[2], values[3])
 
     def on_right_click(self, event):
         """右键菜单"""

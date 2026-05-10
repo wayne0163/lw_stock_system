@@ -39,6 +39,7 @@ python scripts/gen_stock_report.py <ts_code>  # Generate deep fundamental report
 - Other tabs: `strategy_tab.py`, `financial_tab.py`, `reports_tab.py`, `settings_tab.py`.
 - `widgets/filter_panel.py` — Reusable multi-tab filter widget.
 - `utils.py` — `center_window()`, `generate_stock_report()` threading wrapper.
+- `stock_chart.py` — `show_stock_chart()`: embedded candlestick chart dialog built on mplfinance + matplotlib. Shows 300-day K-line, volume bars, and RSI(14) with overbought/oversold lines.
 
 **Scripts Layer** (`scripts/`) — CLI/cron-friendly automation:
 - `auto_tasks.py` — Unified CLI gateway: `--add-watchlist`, `--gen-reports`, `--ai-audit`, `--sync-market`.

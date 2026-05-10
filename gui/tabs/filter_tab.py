@@ -299,7 +299,8 @@ class FilterTab:
         sel = self.tree.selection()
         if not sel: return
         v = self.tree.item(sel[0], 'values')
-        messagebox.showinfo(f"详情: {v[1]}", f"均线状态: {v[4]}\nRSI状态: {v[5]}\n成交量: {v[6]}")
+        from gui.stock_chart import show_stock_chart
+        show_stock_chart(self.parent, v[0], v[1])
 
     def sort_column(self, col, reverse):
         l = [(self.tree.set(k, col), k) for k in self.tree.get_children('')]
